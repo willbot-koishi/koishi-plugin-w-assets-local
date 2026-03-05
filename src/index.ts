@@ -1,97 +1,505 @@
-import { Context, z } from 'koishi'
-import {} from '@koishijs/plugin-server'
-import LocalAssets from 'koishi-plugin-assets-local'
-
-import { createHmac } from 'node:crypto'
 import path from 'node:path'
-import url from 'node:url'
-import fs, { ReadStream } from 'node:fs'
+import { createHash, createHmac } from 'node:crypto'
+import { Readable, Transform, Writable } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
+
+import type {} from '@koishijs/plugin-server'
+import { Context, sanitize, Schema as z, $ } from 'koishi'
+import AssetsPro, { AssetCreateInfo, AssetInfo, AssetLife, AssetUsageInfo, GcOptions, GcResult } from 'koishi-plugin-w-assets-core'
+
+import type Koa from 'koa'
+import type {} from 'koa-body'
+
+import FileType from 'file-type'
+import mime from 'mime-types'
+import fs from 'fs-extra'
+import pLimit from 'p-limit'
+import NullWritable from 'null-writable'
+
+import { zNumberString, zPosint, zValidator } from './utils'
 
 declare module 'koishi' {
-    interface Context {
-        assetsAlt: LocalAltAssets
-    }
+  interface Tables {
+    'w-assets-stats': AssetsPro.Stats
+    'w-assets-local-stats': AssetsProLocal.Stats
+    'w-assets-info': AssetInfo
+  }
 }
 
-const streamToBuffer = async (stream: ReadStream): Promise<Buffer> => {
-    const chunks: Buffer[] = []
-    for await (const chunk of stream) chunks.push(chunk)
-    return Buffer.concat(chunks)
-}
+class AssetsProLocal extends AssetsPro<AssetsProLocal.Config> {
+  static inject = ['server', 'database']
 
-const fileExists = async (path: string): Promise<boolean> => fs.promises.access(path)
-    .then(() => true)
-    .catch(() => false)
+  protected rootPath: string
+  protected selfUrl: string | undefined
+  protected path: string | undefined
+  protected baseUrl: string
+  protected noServer = false
 
-class LocalAltAssets extends LocalAssets {
-    static name = 'w-assets-local'
+  constructor(ctx: Context, config: AssetsProLocal.Config) {
+    super(ctx, config)
 
-    protected pathAlt: string
-    protected rootAlt: string
-    protected noServerAlt: boolean
-    protected baseUrlAlt: string
+    ctx.model.extend('w-assets-stats', {
+      id: 'unsigned',
+      assetCount: 'unsigned',
+      assetSize: 'unsigned',
+    })
 
-    constructor(ctx: Context, public config: LocalAltAssets.Config) {
-        super(ctx, config)
-        this.pathAlt = this['path']
-        this.noServerAlt = this['noServer']
-        this.baseUrlAlt = this['baseUrl']
-        this.rootAlt = path.resolve(ctx.baseDir, config.root)
-        ctx.set('assetsAlt', this)
+    ctx.model.extend('w-assets-local-stats', {
+      id: 'unsigned',
+      prevDefaultLife: 'unsigned',
+    })
+
+    ctx.model.extend('w-assets-info', {
+      id: 'string',
+      categoryId: 'string',
+      name: 'string',
+      size: 'unsigned',
+      type: 'string',
+      checksum: 'string',
+      sourceUrl: 'string',
+      createdAt: 'unsigned',
+      life: 'integer',
+      expiresAt: 'unsigned',
+    }, {
+      primary: 'id',
+    })
+
+    this.rootPath = path.resolve(ctx.baseDir, config.baseDir)
+    this.selfUrl = config.selfUrl || ctx.server.config.selfUrl
+
+    if (this.selfUrl && config.path) {
+      this.path = sanitize(config.path)
+      this.baseUrl = new URL(this.path, this.selfUrl).href
+    }
+    else {
+      this.ctx.logger.info('missing config "selfUrl", fallback to "file:" scheme')
+      this.baseUrl = 'file://'
+      this.noServer = true
+    }
+  }
+
+  protected async start() {
+    await Promise.all([
+      this.initFilesystem(),
+      this.initDatabase(),
+      this.noServer || this.initServer(),
+    ])
+  }
+
+  protected resolve(id: string) {
+    return path.resolve(this.rootPath, id)
+  }
+
+  protected url(id: string) {
+    return `${this.baseUrl}/${id}`
+  }
+
+  async uploadFromUrl(url: string, assetCreate: AssetCreateInfo): Promise<AssetUsageInfo> {
+    const file = await this.ctx.http.file(url)
+    const buffer = Buffer.from(file.data)
+
+    return this.uploadFromFile(buffer, {
+      type: file.type,
+      ...assetCreate,
+      sourceUrl: url
+    })
+  }
+
+  protected calcExpiresAt(createdAt: number, life: number): number {
+    if (life === AssetLife.Auto) life = this.config.gc.defaultLife
+    else if (life === AssetLife.Permanent) return 0
+    return createdAt + life
+  }
+
+  protected async updateExpiresAtForAutoLifeAssets() {
+    const life = this.config.gc.defaultLife
+    await Promise.all([
+      this.ctx.database.set('w-assets-info', { life: AssetLife.Auto }, row => ({
+        expiresAt: $.add(row.createdAt, life),
+      })),
+      this.ctx.database.set('w-assets-local-stats', 1, {
+        prevDefaultLife: this.config.gc.defaultLife,
+      }),
+    ])
+  }
+
+  async uploadFromFile(file: Buffer | Readable | string, { ...assetCreate }: AssetCreateInfo): Promise<AssetUsageInfo> {
+    const id = crypto.randomUUID()
+    const assetPath = this.resolve(id)
+
+    // Convert file input to a readable stream
+    const fileStream: Readable = (
+      typeof file === 'string' ? fs.createReadStream(file) :
+      file instanceof Readable ? file :
+      Readable.from(file)
+    )
+
+    // Create a transform stream to calculate hash and size
+    const hash = createHash('sha256')
+    let size = 0
+    const analyze = new Transform({
+      transform(chunk: Buffer, _, callback) {
+        hash.update(chunk)
+        size += chunk.byteLength
+        callback(null, chunk)
+      },
+    })
+
+    // Create a writable stream to save the file if it's not already on disk
+    const sinkStream = typeof file === 'string'
+      ? new NullWritable()
+      : fs.createWriteStream(assetPath)
+
+    // Run the pipeline
+    await pipeline(
+      fileStream,
+      analyze,
+      sinkStream,
+    )
+
+    // Get checksum and check for duplicates
+    const checksum = hash.digest('hex')
+
+    const [duplicate] = await this.ctx.database.get('w-assets-info', { checksum })
+    if (duplicate) {
+      if (typeof file !== 'string') await fs.rm(assetPath, { force: true })
+      return { ...duplicate, url: this.url(duplicate.id) }
     }
 
-    public async uploadFile(file: Blob | Buffer | string, name: string): Promise<string> {
-        const savePath = path.resolve(this.rootAlt, name)
-        if (await fileExists(savePath)) throw 409
+    // Move the file if it was uploaded from existing path
+    if (typeof file === 'string') await fs.rename(file, assetPath)
 
-        const fileBuffer: Buffer
-            = file instanceof Blob ? Buffer.from(await file.arrayBuffer())
-            : typeof file === 'string' ? Buffer.from(file)
-            : file
-        await this.write(fileBuffer, savePath)
-
-        return this.noServerAlt
-            ? url.pathToFileURL(savePath).href
-            : `${this.baseUrlAlt}/${name}`
+    // Detect the file type if not provided
+    if (! assetCreate.type) {
+      const fileType = await FileType.fromFile(assetPath)
+      assetCreate.type = fileType?.ext
     }
 
-    public async initServer() {
-        await super.initServer()
-
-        this.ctx.server.put(this.pathAlt, async (ktx) => {
-            const {
-                query: { salt, sign },
-                request: { files: { asset } }
-            } = ktx
-            if (asset instanceof Array) return ktx.status = 400
-
-            const { originalFilename: name } = asset
-
-            if (this.config.secret) {
-                if (! salt || ! sign) return ktx.status = 400
-                const hash = createHmac('sha1', this.config.secret).update(name + salt).digest('hex')
-                if (hash !== sign) return ktx.status = 403
-            }
-
-            const assetStream = fs.createReadStream(asset.filepath)
-            const assetBuffer = await streamToBuffer(assetStream)
-
-            try {
-                const assetUrl = await this.uploadFile(assetBuffer, name)
-                ktx.status = 200
-                ktx.body = assetUrl
-            }
-            catch (errCode) {
-                return ktx.status = errCode
-            }
-        })
+    // Ensure the asset has a name and an extension if possible
+    let name = assetCreate.name ??= id
+    if (! name.includes('.') && assetCreate.type) {
+      const extension = mime.extension(assetCreate.type)
+      name += `.${extension}`
     }
+
+    const life = assetCreate.life ?? AssetLife.Auto
+    const createdAt = Date.now()
+    const expiresAt = this.calcExpiresAt(createdAt, life)
+    const asset: AssetInfo = {
+      ...assetCreate,
+      name,
+      checksum,
+      id,
+      size,
+      life,
+      createdAt,
+      expiresAt,
+    }
+    await Promise.all([
+      this.ctx.database.create('w-assets-info', asset),
+      this.ctx.database.set('w-assets-stats', 1, row => ({
+        assetCount: $.add(row.assetCount, 1),
+        assetSize: $.add(row.assetSize, asset.size),
+      })),
+    ])
+
+    return { ...asset, url: this.url(asset.id) }
+  }
+
+  async delete(id: string): Promise<boolean> {
+    const [asset] = await this.ctx.database.get('w-assets-info', { id })
+    if (! asset) return false
+
+    await fs.rm(this.resolve(id), { force: true })
+    await Promise.all([
+      this.ctx.database.remove('w-assets-info', { id }),
+      this.ctx.database.set('w-assets-stats', 1, row => ({
+        assetCount: $.sub(row.assetCount, 1),
+        assetSize: $.sub(row.assetSize, asset.size),
+      }))
+    ])
+
+    return true
+  }
+
+  async gc({}: GcOptions): Promise<GcResult> {
+    const expiredAssets = await this.ctx.database.get('w-assets-info', {
+      expiresAt: { $gt: 0, $lte: Date.now() },
+    })
+    if (! expiredAssets.length) return { count: 0, size: 0 }
+
+    // Remove all the files
+    const limit = pLimit(this.config.gc.concurrency)
+    const rmPromises = expiredAssets.map(asset => limit(() =>
+      fs.rm(this.resolve(asset.id), { force: true })
+    ))
+    await Promise.all(rmPromises)
+
+    // Remove the metadata records and update stats
+
+    const ids = expiredAssets.map(asset => asset.id)
+    const size = expiredAssets.reduce((total, asset) => total + asset.size, 0)
+    await Promise.all([
+      this.ctx.database.remove('w-assets-info', { id: { $in: ids } }),
+      this.ctx.database.set('w-assets-stats', 1, row => ({
+        assetCount: $.sub(row.assetCount, expiredAssets.length),
+        assetSize: $.sub(row.assetSize, size),
+      })),
+    ])
+
+    return { count: expiredAssets.length, size }
+  }
+
+  async stats() {
+    const [stats] = await this.ctx.database.get('w-assets-stats', 1)
+    return stats
+  }
+
+  protected async initFilesystem() {
+    await fs.ensureDir(this.rootPath)
+  }
+
+  protected async initDatabase() {
+    const [stats] = await this.ctx.database.get('w-assets-stats', 1)
+    if (! stats) await this.ctx.database.create('w-assets-stats', {
+      id: 1,
+      assetCount: 0,
+      assetSize: 0,
+    })
+
+    const [localStats] = await this.ctx.database.get('w-assets-local-stats', 1)
+    if (! localStats) await this.ctx.database.create('w-assets-local-stats', {
+      id: 1,
+      prevDefaultLife: this.config.gc.defaultLife,
+    })
+    else if (localStats.prevDefaultLife !== this.config.gc.defaultLife) {
+      await this.updateExpiresAtForAutoLifeAssets()
+    }
+  }
+
+  protected initServer() {
+    const Ok = (data = {}) => ({ ok: 1, ...data })
+    const Err = (reason: string, data = {}) => ({ ok: 0, reason, ...data })
+
+    const streamAsset = async (ktx: Koa.Context, asset: AssetInfo) => {
+      if (! asset) {
+        ktx.status = 404
+        return ktx.body = Err('Asset not found')
+      }
+
+      const assetPath = this.resolve(asset.id)
+      const stream = fs.createReadStream(assetPath)
+      if (asset.type) ktx.type = asset.type
+      ktx.attachment(asset.name, { type: ktx.query.inline === '1' ? 'inline' : 'attachment' })
+      return ktx.body = stream
+    }
+
+    const usedNonces = new Map<string, number>()
+
+    const auth = (ktx: Koa.Context): boolean => {
+      const signature = ktx.headers['x-signature']
+      const nonce = ktx.headers['x-nonce']
+      const timestamp = ktx.headers['x-timestamp']
+
+      if (typeof signature !== 'string' || typeof nonce !== 'string' || typeof timestamp !== 'string') {
+        ktx.status = 400
+        ktx.body = Err('Missing authentication headers')
+        return false
+      }
+
+      const timestampNum = Number(timestamp)
+      if (isNaN(timestampNum)) {
+        ktx.status = 400
+        ktx.body = Err('Invalid timestamp')
+        return false
+      }
+
+      const timeDiff = Math.abs(Date.now() - Number(timestamp))
+      if (timeDiff > this.config.nonceExpire) {
+        ktx.status = 401
+        ktx.body = Err('Request expired')
+        return false
+      }
+
+      if (usedNonces.has(nonce)) {
+        ktx.status = 401
+        ktx.body = Err('Nonce already used')
+        return false
+      }
+
+      const expectedSignature = createHmac('sha256', this.config.secret)
+        .update(nonce + timestamp)
+        .digest('hex')
+
+      if (signature !== expectedSignature) {
+        ktx.status = 401
+        ktx.body = Err('Invalid signature')
+        return false
+      }
+
+      usedNonces.set(nonce, Date.now())
+      return true
+    }
+
+    this.ctx.setInterval(() => {
+      const now = Date.now()
+      for (const [nonce, timestamp] of usedNonces) {
+        if (now - timestamp > this.config.nonceExpire) {
+          usedNonces.delete(nonce)
+        }
+      }
+    }, this.config.nonceExpire)
+
+    const useAuth = (middleware: Koa.Middleware): Koa.Middleware => {
+      return (ktx, next) => {
+        if (! auth(ktx)) return
+        return middleware(ktx, next)
+      }
+    }
+
+    const useCatch = (middleware: Koa.Middleware): Koa.Middleware => {
+      return async (ktx, next) => {
+        try {
+          return await middleware(ktx, next)
+        }
+        catch (err) {
+          if (err instanceof z.ValidationError) {
+            ktx.status = 400
+            return ktx.body = Err('Invalid request data', {
+              details: err.message,
+            })
+          }
+          throw err
+        }
+      }
+    }
+
+    const route = (method: 'get' | 'post' | 'put' | 'delete', path: string, middleware: Koa.Middleware) => {
+      this.ctx.server[method](`${this.path}${path}`, useCatch(middleware))
+    }
+
+    // GET / - list assets
+    const DEFAULT_LIST_LIMIT = 20
+    const zListQuery = zValidator(z.object({
+      page: zNumberString(zPosint()).default('1'),
+      limit: zNumberString(zPosint()).default(`${DEFAULT_LIST_LIMIT}`),
+    }))
+
+    route('get', '/', useAuth(async (ktx) => {
+      const { page, limit } = zListQuery(ktx.query)
+
+      const assets = await this.ctx.database.get('w-assets-info', {}, {
+        limit,
+        offset: (page - 1) * limit,
+      })
+      return ktx.body = Ok({ assets })
+    }))
+
+    // GET /stats - get asset stats
+    route('get', '/stats', useAuth(async (ktx) => {
+      return ktx.body = Ok(await this.stats())
+    }))
+
+    // POST /gc - garbage collect expired assets
+    route('post', '/gc', useAuth(async (ktx) => {
+      return ktx.body = Ok(await this.gc({}))
+    }))
+
+    // GET /:id - download asset
+    const zAssetIdParams = zValidator(z.object({
+      id: z.string().required(),
+    }))
+    route('get', '/:id', async (ktx) => {
+      const { id } = zAssetIdParams(ktx.params)
+      const [asset] = await this.ctx.database.get('w-assets-info', { id })
+      return streamAsset(ktx, asset)
+    })
+
+    // POST / - upload asset
+    const zUploadBody = zValidator(z.object({
+      url: z.string(),
+      name: z.string(),
+    }))
+
+    route('post', '/', useAuth(async (ktx: Koa.Context) => {
+      const { url, name } = zUploadBody(ktx.request.body)
+
+      if (ktx.is('multipart')) {
+        const file = ktx.request.files?.['file']
+
+        if (! file) {
+          ktx.status = 400
+          return ktx.body = Err('Missing file')
+        }
+
+        if (Array.isArray(file)) {
+          ktx.status = 400
+          return ktx.body = Err('Multiple file upload is not supported')
+        }
+
+        const finalName = name ?? (file.originalFilename ? path.basename(file.originalFilename) : undefined)
+        const asset = await this.uploadFromFile(file.filepath, { name: finalName })
+        return ktx.body = Ok({ asset })
+      }
+
+      if (url) {
+        const asset = await this.uploadFromUrl(url, { name })
+        return ktx.body = Ok({ asset })
+      }
+
+      ktx.status = 400
+      return ktx.body = Err('Missing url or file')
+    }))
+
+    // DELETE /:id - delete asset
+    route('delete', '/:id', useAuth(async (ktx) => {
+      const { id } = zAssetIdParams(ktx.params)
+      const success = await this.delete(id)
+      if (! success) {
+        ktx.status = 404
+        return ktx.body = Err('Asset not found')
+      }
+      return ktx.body = Ok()
+    }))
+  }
 }
 
-namespace LocalAltAssets {
-    export interface Config extends LocalAssets.Config {}
+namespace AssetsProLocal {
+  export interface GcConfig {
+    concurrency: number
+    defaultLife: number
+  }
 
-    export const Config: z<Config> = z(JSON.parse(JSON.stringify(LocalAssets.Config)))
+  export const GcConfig: z<GcConfig> = z.object({
+    concurrency: z.number().default(10),
+    defaultLife: z.number().default(7 * 24 * 60 * 60 * 1000),
+  })
+
+  export interface Config extends AssetsPro.Config {
+    baseDir: string
+    selfUrl: string
+    path: string
+    secret: string
+    nonceExpire: number
+
+    gc: GcConfig
+  }
+
+  export const Config: z<Config> = z.object({
+    whitelist: z.array(z.string()).default([]),
+    baseDir: z.string().default('data/assets'),
+    selfUrl: z.string().default(''),
+    path: z.string().default('/assets'),
+    secret: z.string().required(),
+    nonceExpire: z.number().default(5 * 60 * 1000),
+
+    gc: GcConfig,
+  })
+
+  export interface Stats {
+    id: 1
+    prevDefaultLife: number
+  }
 }
 
-export default LocalAltAssets
+export default AssetsProLocal

@@ -10,6 +10,8 @@
     "incremental": true,
     "skipLibCheck": true,
     "esModuleInterop": true,
+    "strict": true,
+    "strictFunctionTypes": false,
     "moduleResolution": "bundler",
     "jsx": "react-jsx",
     "jsxImportSource": "@satorijs/element",

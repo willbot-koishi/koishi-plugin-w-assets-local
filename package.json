@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-w-assets-local",
   "description": "WillBot: local assets",
-  "version": "0.0.1",
+  "version": "1.0.0",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
@@ -15,13 +15,29 @@
     "plugin"
   ],
   "peerDependencies": {
-    "koishi": "^4.18.0"
+    "koishi": "^4.18.10"
   },
   "dependencies": {
-    "koishi-plugin-assets-local": "^3.3.2"
+    "file-type": "^16.5.4",
+    "koishi-plugin-w-assets-core": "workspace:^",
+    "null-writable": "^2.0.1"
   },
   "devDependencies": {
-    "@koishijs/plugin-server": "^3.2.4"
+    "@koishijs/plugin-server": "^3.2.7",
+    "koa": "^3.1.2",
+    "koa-body": "^7.0.1"
+  },
+  "koishi": {
+    "service": {
+      "required": [
+        "database",
+        "server"
+      ],
+      "implements": [
+        "assets",
+        "assetsPro"
+      ]
+    }
   },
   "scripts": {
     "build": "yarn workspace willbot build w-assets-local",
