@@ -1,7 +1,8 @@
 import path from 'node:path'
 import { createHash, createHmac } from 'node:crypto'
-import { Readable, Transform, Writable } from 'node:stream'
+import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
+import { Blob, Buffer } from 'node:buffer'
 
 import type {} from '@koishijs/plugin-server'
 import { Context, sanitize, Schema as z, $ } from 'koishi'
@@ -9,14 +10,12 @@ import AssetsPro, { AssetCreateInfo, AssetInfo, AssetLife, AssetUsageInfo, GcOpt
 
 import type Koa from 'koa'
 import type {} from 'koa-body'
-
 import FileType from 'file-type'
 import mime from 'mime-types'
 import fs from 'fs-extra'
-import pLimit from 'p-limit'
-import NullWritable from 'null-writable'
+import { newQueue } from '@henrygd/queue'
 
-import { zNumberString, zPosint, zValidator } from './utils'
+import { unreachable, zJSON, zNumberString, zPosint, zValidator, Ok, Err, NullWritable } from './utils'
 
 declare module 'koishi' {
   interface Tables {
@@ -34,6 +33,7 @@ class AssetsProLocal extends AssetsPro<AssetsProLocal.Config> {
   protected path: string | undefined
   protected baseUrl: string
   protected noServer = false
+  protected usedNonces = new Map<string, number>()
 
   constructor(ctx: Context, config: AssetsProLocal.Config) {
     super(ctx, config)
@@ -90,7 +90,7 @@ class AssetsProLocal extends AssetsPro<AssetsProLocal.Config> {
     return path.resolve(this.rootPath, id)
   }
 
-  protected url(id: string) {
+  url(id: string) {
     return `${this.baseUrl}/${id}`
   }
 
@@ -123,15 +123,17 @@ class AssetsProLocal extends AssetsPro<AssetsProLocal.Config> {
     ])
   }
 
-  async uploadFromFile(file: Buffer | Readable | string, { ...assetCreate }: AssetCreateInfo): Promise<AssetUsageInfo> {
+  async uploadFromFile(file: Blob | Buffer | Readable | string, { ...assetCreate }: AssetCreateInfo): Promise<AssetUsageInfo> {
     const id = crypto.randomUUID()
     const assetPath = this.resolve(id)
 
     // Convert file input to a readable stream
     const fileStream: Readable = (
-      typeof file === 'string' ? fs.createReadStream(file) :
       file instanceof Readable ? file :
-      Readable.from(file)
+      Buffer.isBuffer(file) ? Readable.from(file) :
+      typeof file === 'string' ? fs.createReadStream(file) :
+      file instanceof Blob ? Readable.fromWeb(file.stream()) :
+      unreachable(file)
     )
 
     // Create a transform stream to calculate hash and size
@@ -229,14 +231,12 @@ class AssetsProLocal extends AssetsPro<AssetsProLocal.Config> {
     if (! expiredAssets.length) return { count: 0, size: 0 }
 
     // Remove all the files
-    const limit = pLimit(this.config.gc.concurrency)
-    const rmPromises = expiredAssets.map(asset => limit(() =>
+    const rmQueue = newQueue(this.config.gc.concurrency)
+    await rmQueue.all(expiredAssets.map((asset =>
       fs.rm(this.resolve(asset.id), { force: true })
-    ))
-    await Promise.all(rmPromises)
+    )))
 
     // Remove the metadata records and update stats
-
     const ids = expiredAssets.map(asset => asset.id)
     const size = expiredAssets.reduce((total, asset) => total + asset.size, 0)
     await Promise.all([
@@ -277,116 +277,108 @@ class AssetsProLocal extends AssetsPro<AssetsProLocal.Config> {
     }
   }
 
-  protected initServer() {
-    const Ok = (data = {}) => ({ ok: 1, ...data })
-    const Err = (reason: string, data = {}) => ({ ok: 0, reason, ...data })
-
-    const streamAsset = async (ktx: Koa.Context, asset: AssetInfo) => {
-      if (! asset) {
-        ktx.status = 404
-        return ktx.body = Err('Asset not found')
-      }
-
-      const assetPath = this.resolve(asset.id)
-      const stream = fs.createReadStream(assetPath)
-      if (asset.type) ktx.type = asset.type
-      ktx.attachment(asset.name, { type: ktx.query.inline === '1' ? 'inline' : 'attachment' })
-      return ktx.body = stream
+  protected async streamAsset(ktx: Koa.Context, asset: AssetInfo | undefined) {
+    if (! asset) {
+      ktx.status = 404
+      return ktx.body = Err('Asset not found')
     }
 
-    const usedNonces = new Map<string, number>()
+    const assetPath = this.resolve(asset.id)
+    const stream = fs.createReadStream(assetPath)
+    if (asset.type) ktx.type = asset.type
+    ktx.attachment(asset.name, { type: ktx.query.inline === '1' ? 'inline' : 'attachment' })
+    return ktx.body = stream
+  }
 
-    const auth = (ktx: Koa.Context): boolean => {
-      const signature = ktx.headers['x-signature']
-      const nonce = ktx.headers['x-nonce']
-      const timestamp = ktx.headers['x-timestamp']
+  protected auth(ktx: Koa.Context): boolean {
+    const signature = ktx.headers['x-signature']
+    const nonce = ktx.headers['x-nonce']
+    const timestamp = ktx.headers['x-timestamp']
 
-      if (typeof signature !== 'string' || typeof nonce !== 'string' || typeof timestamp !== 'string') {
-        ktx.status = 400
-        ktx.body = Err('Missing authentication headers')
-        return false
-      }
-
-      const timestampNum = Number(timestamp)
-      if (isNaN(timestampNum)) {
-        ktx.status = 400
-        ktx.body = Err('Invalid timestamp')
-        return false
-      }
-
-      const timeDiff = Math.abs(Date.now() - Number(timestamp))
-      if (timeDiff > this.config.nonceExpire) {
-        ktx.status = 401
-        ktx.body = Err('Request expired')
-        return false
-      }
-
-      if (usedNonces.has(nonce)) {
-        ktx.status = 401
-        ktx.body = Err('Nonce already used')
-        return false
-      }
-
-      const expectedSignature = createHmac('sha256', this.config.secret)
-        .update(nonce + timestamp)
-        .digest('hex')
-
-      if (signature !== expectedSignature) {
-        ktx.status = 401
-        ktx.body = Err('Invalid signature')
-        return false
-      }
-
-      usedNonces.set(nonce, Date.now())
-      return true
+    if (typeof signature !== 'string' || typeof nonce !== 'string' || typeof timestamp !== 'string') {
+      ktx.status = 400
+      ktx.body = Err('Missing authentication headers')
+      return false
     }
 
-    this.ctx.setInterval(() => {
-      const now = Date.now()
-      for (const [nonce, timestamp] of usedNonces) {
-        if (now - timestamp > this.config.nonceExpire) {
-          usedNonces.delete(nonce)
+    const time = Number(timestamp)
+    if (isNaN(time)) {
+      ktx.status = 400
+      ktx.body = Err('Invalid timestamp')
+      return false
+    }
+
+    const timeDiff = Math.abs(Date.now() - time)
+    if (timeDiff > this.config.nonceExpire) {
+      ktx.status = 401
+      ktx.body = Err('Request expired')
+      return false
+    }
+
+    if (this.usedNonces.has(nonce)) {
+      ktx.status = 401
+      ktx.body = Err('Nonce already used')
+      return false
+    }
+
+    const expectedSignature = createHmac('sha256', this.config.secret)
+      .update(nonce + timestamp)
+      .digest('hex')
+
+    if (signature !== expectedSignature) {
+      ktx.status = 401
+      ktx.body = Err('Invalid signature')
+      return false
+    }
+
+    this.usedNonces.set(nonce, Date.now())
+    return true
+  }
+
+  protected cleanupUsedNonces() {
+    const now = Date.now()
+    for (const [nonce, timestamp] of this.usedNonces) {
+      if (now - timestamp > this.config.nonceExpire) {
+        this.usedNonces.delete(nonce)
+      }
+    }
+  }
+
+  protected useAuth(middleware: Koa.Middleware): Koa.Middleware {
+    return (ktx, next) => {
+      if (! this.auth(ktx)) return
+      return middleware(ktx, next)
+    }
+  }
+
+  protected useCatch(middleware: Koa.Middleware): Koa.Middleware {
+    return async (ktx, next) => {
+      try {
+        return await middleware(ktx, next)
+      }
+      catch (err) {
+        if (err instanceof z.ValidationError) {
+          ktx.status = 400
+          return ktx.body = Err('Invalid request data', {
+            details: err.message,
+          })
         }
+        throw err
       }
+    }
+  }
+
+  protected route(method: 'get' | 'post' | 'put' | 'delete', routePath: string, middleware: Koa.Middleware) {
+    this.ctx.server[method](`${this.path}${routePath}`, this.useCatch(middleware))
+  }
+
+  protected initServer() {
+    this.ctx.setInterval(() => {
+      this.cleanupUsedNonces()
     }, this.config.nonceExpire)
 
-    const useAuth = (middleware: Koa.Middleware): Koa.Middleware => {
-      return (ktx, next) => {
-        if (! auth(ktx)) return
-        return middleware(ktx, next)
-      }
-    }
-
-    const useCatch = (middleware: Koa.Middleware): Koa.Middleware => {
-      return async (ktx, next) => {
-        try {
-          return await middleware(ktx, next)
-        }
-        catch (err) {
-          if (err instanceof z.ValidationError) {
-            ktx.status = 400
-            return ktx.body = Err('Invalid request data', {
-              details: err.message,
-            })
-          }
-          throw err
-        }
-      }
-    }
-
-    const route = (method: 'get' | 'post' | 'put' | 'delete', path: string, middleware: Koa.Middleware) => {
-      this.ctx.server[method](`${this.path}${path}`, useCatch(middleware))
-    }
-
-    // GET / - list assets
-    const DEFAULT_LIST_LIMIT = 20
-    const zListQuery = zValidator(z.object({
-      page: zNumberString(zPosint()).default('1'),
-      limit: zNumberString(zPosint()).default(`${DEFAULT_LIST_LIMIT}`),
-    }))
-
-    route('get', '/', useAuth(async (ktx) => {
-      const { page, limit } = zListQuery(ktx.query)
+    this.route('get', '/', this.useAuth(async (ktx) => {
+      const { page, limit } = Protocol.zListQuery(ktx.query)
 
       const assets = await this.ctx.database.get('w-assets-info', {}, {
         limit,
@@ -396,35 +388,29 @@ class AssetsProLocal extends AssetsPro<AssetsProLocal.Config> {
     }))
 
     // GET /stats - get asset stats
-    route('get', '/stats', useAuth(async (ktx) => {
+    this.route('get', '/stats', this.useAuth(async (ktx) => {
       return ktx.body = Ok(await this.stats())
     }))
 
     // POST /gc - garbage collect expired assets
-    route('post', '/gc', useAuth(async (ktx) => {
+    this.route('post', '/gc', this.useAuth(async (ktx) => {
       return ktx.body = Ok(await this.gc({}))
     }))
 
     // GET /:id - download asset
-    const zAssetIdParams = zValidator(z.object({
-      id: z.string().required(),
-    }))
-    route('get', '/:id', async (ktx) => {
-      const { id } = zAssetIdParams(ktx.params)
+    this.route('get', '/:id', async (ktx) => {
+      const { id } = Protocol.zAssetIdParams(ktx.params)
       const [asset] = await this.ctx.database.get('w-assets-info', { id })
-      return streamAsset(ktx, asset)
+      return this.streamAsset(ktx, asset)
     })
 
     // POST / - upload asset
-    const zUploadBody = zValidator(z.object({
-      url: z.string(),
-      name: z.string(),
-    }))
-
-    route('post', '/', useAuth(async (ktx: Koa.Context) => {
-      const { url, name } = zUploadBody(ktx.request.body)
+    this.route('post', '/', this.useAuth(async (ktx: Koa.Context) => {
+      // upload by file if multipart
 
       if (ktx.is('multipart')) {
+        const { info = {} } = Protocol.zUploadFromFileBody(ktx.request.body)
+
         const file = ktx.request.files?.['file']
 
         if (! file) {
@@ -437,23 +423,20 @@ class AssetsProLocal extends AssetsPro<AssetsProLocal.Config> {
           return ktx.body = Err('Multiple file upload is not supported')
         }
 
-        const finalName = name ?? (file.originalFilename ? path.basename(file.originalFilename) : undefined)
-        const asset = await this.uploadFromFile(file.filepath, { name: finalName })
-        return ktx.body = Ok({ asset })
+        info.name ??= file.originalFilename ? path.basename(file.originalFilename) : undefined
+        const asset = await this.uploadFromFile(file.filepath, info)
+        return ktx.body = Ok(asset)
       }
 
-      if (url) {
-        const asset = await this.uploadFromUrl(url, { name })
-        return ktx.body = Ok({ asset })
-      }
-
-      ktx.status = 400
-      return ktx.body = Err('Missing url or file')
+      // upload by url otherwise
+      const { info = {}, url } = Protocol.zUploadFromUrlBody(ktx.request.body)
+      const asset = await this.uploadFromUrl(url, info)
+      return ktx.body = Ok(asset)
     }))
 
     // DELETE /:id - delete asset
-    route('delete', '/:id', useAuth(async (ktx) => {
-      const { id } = zAssetIdParams(ktx.params)
+    this.route('delete', '/:id', this.useAuth(async (ktx) => {
+      const { id } = Protocol.zAssetIdParams(ktx.params)
       const success = await this.delete(id)
       if (! success) {
         ktx.status = 404
@@ -500,6 +483,49 @@ namespace AssetsProLocal {
     id: 1
     prevDefaultLife: number
   }
+}
+
+export namespace Protocol {
+  export interface ListQuery {
+    page: number
+    limit: number
+  }
+
+  export const DEFAULT_LIST_LIMIT = 20
+
+  export const zListQuery = zValidator<ListQuery>(z.object({
+    page: zNumberString(zPosint()).default('1'),
+    limit: zNumberString(zPosint()).default(`${DEFAULT_LIST_LIMIT}`),
+  }))
+
+  export const zAssetCreateInfo: z<AssetCreateInfo> = z.object({
+    name: z.string(),
+    type: z.string(),
+    categoryId: z.string(),
+    life: z.number(),
+  })
+
+  export interface UploadFromUrlBody {
+    url: string
+    info?: AssetCreateInfo,
+  }
+
+  export const zUploadFromUrlBody = zValidator<UploadFromUrlBody>(z.object({
+    url: z.string().required(),
+    info: zAssetCreateInfo,
+  }))
+
+  export const zUploadFromFileBody = zValidator(z.object({
+    info: zJSON(zAssetCreateInfo),
+  }))
+
+  export interface AssetIdParams {
+    id: string
+  }
+
+  export const zAssetIdParams = zValidator<AssetIdParams>(z.object({
+    id: z.string().required(),
+  }))
 }
 
 export default AssetsProLocal
