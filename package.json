@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-w-assets-local",
   "description": "WillBot: local assets",
-  "version": "2.0.4",
+  "version": "2.0.5",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
@@ -19,7 +19,7 @@
   },
   "dependencies": {
     "@henrygd/queue": "^1.2.0",
-    "file-type": "^16.5.4",
+    "file-type": "^22.0.0",
     "fs-extra": "^11.3.4",
     "koishi-plugin-w-assets-core": "workspace:^",
     "mime-types": "^3.0.2",

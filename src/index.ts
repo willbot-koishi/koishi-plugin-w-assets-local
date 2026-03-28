@@ -10,7 +10,6 @@ import AssetsPro, { AssetCreateInfo, AssetInfo, AssetLife, AssetUsageInfo, GcOpt
 
 import type Koa from 'koa'
 import type {} from 'koa-body'
-import FileType from 'file-type'
 import mime from 'mime-types'
 import fs from 'fs-extra'
 import { newQueue } from '@henrygd/queue'
@@ -34,6 +33,8 @@ class AssetsProLocal extends AssetsPro<AssetsProLocal.Config> {
   protected baseUrl: string
   protected noServer = false
   protected usedNonces = new Map<string, number>()
+
+  protected FileType: typeof import('file-type') = undefined as any
 
   constructor(ctx: Context, config: AssetsProLocal.Config) {
     super(ctx, config)
@@ -84,6 +85,10 @@ class AssetsProLocal extends AssetsPro<AssetsProLocal.Config> {
       this.initDatabase(),
       this.noServer || this.initServer(),
     ])
+  }
+
+  protected async initEsmDeps() {
+    this.FileType = await import('file-type')
   }
 
   protected resolve(id: string) {
@@ -173,7 +178,7 @@ class AssetsProLocal extends AssetsPro<AssetsProLocal.Config> {
 
     // Detect the file type if not provided
     if (! assetCreate.type) {
-      const fileType = await FileType.fromFile(assetPath)
+      const fileType = await this.FileType.fileTypeFromFile(assetPath)
       assetCreate.type = fileType?.ext
     }
 
